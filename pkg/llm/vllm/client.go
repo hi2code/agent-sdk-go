@@ -513,3 +513,11 @@ func (c *VLLMClient) GenerateWithToolsDetailed(ctx context.Context, prompt strin
 		},
 	}, nil
 }
+
+// GenerateWithToolsMultiContent generates text with tools and supports multi-modal content (text and images)
+func (c *VLLMClient) GenerateWithToolsMultiContent(ctx context.Context, prompt string, inputMultiContent []interfaces.MultiContentPart, tools []interfaces.Tool, options ...interfaces.GenerateOption) (string, error) {
+	// For vLLM, multi-modal content is handled through the standard GenerateWithTools method
+	// as vLLM's API already supports multi-modal inputs in the messages
+	// TODO: Implement proper multi-content handling
+	return c.GenerateWithTools(ctx, prompt, tools, options...)
+}

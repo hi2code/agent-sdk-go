@@ -1,6 +1,8 @@
 package interfaces
 
-import "context"
+import (
+	"context"
+)
 
 // LLM represents a large language model provider
 type LLM interface {
@@ -9,6 +11,8 @@ type LLM interface {
 
 	// GenerateWithTools generates text and can use tools
 	GenerateWithTools(ctx context.Context, prompt string, tools []Tool, options ...GenerateOption) (string, error)
+
+	GenerateWithToolsMultiContent(ctx context.Context, prompt string, inputMultiContent []MultiContentPart, tools []Tool, options ...GenerateOption) (string, error)
 
 	// GenerateDetailed generates text and returns detailed response information including token usage
 	GenerateDetailed(ctx context.Context, prompt string, options ...GenerateOption) (*LLMResponse, error)

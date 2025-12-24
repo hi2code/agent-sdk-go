@@ -377,3 +377,52 @@ func (m *TracedLLM) GenerateWithToolsDetailed(ctx context.Context, prompt string
 
 	return response, nil
 }
+
+// GenerateWithToolsMultiContent generates text with tools and supports multi-modal content (text and images)
+func (m *TracedLLM) GenerateWithToolsMultiContent(ctx context.Context, prompt string, inputMultiContent []interfaces.MultiContentPart, tools []interfaces.Tool, options ...interfaces.GenerateOption) (string, error) {
+	startTime := time.Now()
+
+	// Start span
+	ctx, span := m.tracer.StartSpan(ctx, "llm.generate_with_tools_multi_content")
+	defer span.End()
+
+	// Add attributes
+	span.SetAttribute("prompt.length", len(prompt))
+	span.SetAttribute("prompt.hash", hashString(prompt))
+	span.SetAttribute("tools.count", len(tools))
+	span.SetAttribute("multi_content.count", len(inputMultiContent))
+
+	// Extract model name from LLM client
+	model := "unknown"
+	if modelProvider, ok := m.llm.(interface{ GetModel() string }); ok {
+		model = modelProvider.GetModel()
+	}
+	if model == "" {
+		model = m.llm.Name() // fallback to provider name
+	}
+	span.SetAttribute("model", model)
+
+	// Add tool names as attributes
+	toolNames := make([]string, len(tools))
+	for i, tool := range tools {
+		toolNames[i] = tool.Name()
+	}
+	span.SetAttribute("tools.names", strings.Join(toolNames, ","))
+
+	// Call the underlying LLM
+	response, err := m.llm.GenerateWithToolsMultiContent(ctx, prompt, inputMultiContent, tools, options...)
+
+	endTime := time.Now()
+	duration := endTime.Sub(startTime)
+
+	// Add response attributes
+	if err == nil {
+		span.SetAttribute("response.length", len(response))
+		span.SetAttribute("response.hash", hashString(response))
+		span.SetAttribute("duration_ms", duration.Milliseconds())
+	} else {
+		span.RecordError(err)
+	}
+
+	return response, err
+}

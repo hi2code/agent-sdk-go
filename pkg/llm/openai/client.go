@@ -1081,3 +1081,630 @@ func (c *OpenAIClient) GenerateWithToolsDetailed(ctx context.Context, prompt str
 		},
 	}, nil
 }
+
+// GenerateWithToolsMultiContent generates text with tools and supports multi-modal content (text and images)
+func (c *OpenAIClient) GenerateWithToolsMultiContent(ctx context.Context, prompt string, inputMultiContent []interfaces.MultiContentPart, tools []interfaces.Tool, options ...interfaces.GenerateOption) (string, error) {
+	// Apply options
+	params := &interfaces.GenerateOptions{}
+	for _, opt := range options {
+		if opt != nil {
+			opt(params)
+		}
+	}
+
+	// Set default values only if they're not provided
+	if params.LLMConfig == nil {
+		params.LLMConfig = &interfaces.LLMConfig{
+			Temperature:      0.7,
+			TopP:             1.0,
+			FrequencyPenalty: 0.0,
+			PresencePenalty:  0.0,
+		}
+	}
+
+	// Set default max iterations if not provided
+	maxIterations := params.MaxIterations
+	if maxIterations == 0 {
+		maxIterations = 2 // Default to current behavior
+	}
+
+	// Check for organization ID in context
+	orgID := "default"
+	if id, err := multitenancy.GetOrgID(ctx); err == nil {
+		orgID = id
+	}
+	ctx = context.WithValue(ctx, organizationKey, orgID)
+
+	// Convert tools to OpenAI format
+	openaiTools := make([]openai.ChatCompletionToolUnionParam, len(tools))
+	for i, tool := range tools {
+		// Convert ParameterSpec to JSON Schema
+		properties := make(map[string]interface{})
+		required := []string{}
+
+		for name, param := range tool.Parameters() {
+			properties[name] = map[string]interface{}{
+				"type":        param.Type,
+				"description": param.Description,
+			}
+			if param.Default != nil {
+				properties[name].(map[string]interface{})["default"] = param.Default
+			}
+			if param.Required {
+				required = append(required, name)
+			}
+			if param.Items != nil {
+				properties[name].(map[string]interface{})["items"] = map[string]interface{}{
+					"type": param.Items.Type,
+				}
+				if param.Items.Enum != nil {
+					properties[name].(map[string]interface{})["items"].(map[string]interface{})["enum"] = param.Items.Enum
+				}
+			}
+			if param.Enum != nil {
+				properties[name].(map[string]interface{})["enum"] = param.Enum
+			}
+		}
+
+		openaiTools[i] = openai.ChatCompletionFunctionTool(shared.FunctionDefinitionParam{
+			Name:        tool.Name(),
+			Description: openai.String(tool.Description()),
+			Parameters: map[string]interface{}{
+				"type":       "object",
+				"properties": properties,
+				"required":   required,
+			},
+		})
+	}
+
+	// Build messages with memory and current prompt
+	builder := newMessageHistoryBuilder(c.logger)
+	messages := builder.buildMessages(ctx, prompt, params.Memory)
+
+	// If we have multi-content input, create a multi-modal user message
+	if len(inputMultiContent) > 0 {
+		// Create content parts for OpenAI
+		contentParts := []openai.ChatCompletionContentPartUnionParam{}
+
+		for _, part := range inputMultiContent {
+			switch part.Type {
+			case interfaces.ContentPartTypeText:
+				contentParts = append(contentParts, openai.TextContentPart(part.Text))
+			case interfaces.ContentPartTypeImage:
+				if part.Image != nil {
+					// Create image content part
+					imageURL := openai.ChatCompletionContentPartImageImageURLParam{
+						URL:    part.Image.URLOrBase64,
+						Detail: part.Image.Detail,
+					}
+					contentParts = append(contentParts, openai.ImageContentPart(imageURL))
+				}
+			}
+		}
+
+		// Add text prompt as additional text content if provided
+		if prompt != "" {
+			contentParts = append(contentParts, openai.TextContentPart(prompt))
+		}
+
+		// Create user message with multi-modal content
+		userMessage := openai.UserMessage(contentParts)
+
+		// Replace the last user message (which is the prompt) with our multi-modal message
+		// or add it if there's no existing user message
+		foundUserMessage := false
+		for i, msg := range messages {
+			// Check if this is a user message by checking if OfUser field is not nil
+			if msg.OfUser != nil {
+				messages[i] = userMessage
+				foundUserMessage = true
+				break
+			}
+		}
+
+		if !foundUserMessage {
+			messages = append(messages, userMessage)
+		}
+	}
+
+	// Track tool call repetitions for loop detection
+	toolCallHistory := make(map[string]int)
+	var toolCallHistoryMu sync.Mutex
+
+	// Add system message if available (for reasoning mode)
+	if params.SystemMessage != "" {
+		messages = append(messages, openai.SystemMessage(params.SystemMessage))
+		c.logger.Debug(ctx, "Using system message", map[string]interface{}{"system_message": params.SystemMessage})
+	}
+
+	req := openai.ChatCompletionNewParams{
+		Model:            openai.ChatModel(c.Model),
+		Messages:         messages,
+		Tools:            openaiTools,
+		Temperature:      openai.Float(c.getTemperatureForModel(params.LLMConfig.Temperature)),
+		FrequencyPenalty: openai.Float(params.LLMConfig.FrequencyPenalty),
+		PresencePenalty:  openai.Float(params.LLMConfig.PresencePenalty),
+	}
+
+	// Reasoning models don't support top_p parameter
+	if !isReasoningModel(c.Model) {
+		req.TopP = openai.Float(params.LLMConfig.TopP)
+	}
+
+	// Only set ParallelToolCalls for non-reasoning models
+	if !isReasoningModel(c.Model) {
+		req.ParallelToolCalls = openai.Bool(true)
+	}
+
+	if len(params.LLMConfig.StopSequences) > 0 {
+		req.Stop = openai.ChatCompletionNewParamsStopUnion{OfStringArray: params.LLMConfig.StopSequences}
+	}
+
+	// Set reasoning effort for reasoning models
+	if isReasoningModel(c.Model) && params.LLMConfig.Reasoning != "" {
+		req.ReasoningEffort = shared.ReasoningEffort(params.LLMConfig.Reasoning)
+		c.logger.Debug(ctx, "Setting reasoning effort", map[string]interface{}{"reasoning_effort": params.LLMConfig.Reasoning})
+	}
+
+	// Set response format if provided
+	if params.ResponseFormat != nil {
+		// Convert to the new API's response format structure
+		jsonSchema := shared.ResponseFormatJSONSchemaJSONSchemaParam{
+			Name:   params.ResponseFormat.Name,
+			Schema: params.ResponseFormat.Schema,
+		}
+
+		req.ResponseFormat = openai.ChatCompletionNewParamsResponseFormatUnion{
+			OfJSONSchema: &shared.ResponseFormatJSONSchemaParam{
+				Type:       "json_schema",
+				JSONSchema: jsonSchema,
+			},
+		}
+		c.logger.Debug(ctx, "Using response format", map[string]interface{}{"format": *params.ResponseFormat})
+	}
+
+	// Iterative tool calling loop
+	for iteration := 0; iteration < maxIterations; iteration++ {
+		// Update request with current messages
+		req.Messages = messages
+
+		// Send request
+		var reasoningEffort string
+		if params.LLMConfig != nil && params.LLMConfig.Reasoning != "" {
+			reasoningEffort = params.LLMConfig.Reasoning
+		} else {
+			reasoningEffort = "none"
+		}
+
+		c.logger.Debug(ctx, "Sending request with tools to OpenAI", map[string]interface{}{
+			"model":             c.Model,
+			"temperature":       req.Temperature,
+			"top_p":             req.TopP,
+			"frequency_penalty": req.FrequencyPenalty,
+			"presence_penalty":  req.PresencePenalty,
+			"stop_sequences":    req.Stop,
+			"messages":          len(req.Messages),
+			"tools":             len(req.Tools),
+			"response_format":   params.ResponseFormat != nil,
+			"parallel_tools":    req.ParallelToolCalls,
+			"reasoning_effort":  reasoningEffort,
+			"iteration":         iteration + 1,
+			"maxIterations":     maxIterations,
+		})
+		resp, err := c.ChatService.Completions.New(ctx, req)
+		if err != nil {
+			c.logger.Error(ctx, "Error from OpenAI API", map[string]interface{}{"error": err.Error()})
+			return "", fmt.Errorf("failed to create chat completion: %w", err)
+		}
+
+		if len(resp.Choices) == 0 {
+			return "", fmt.Errorf("no completions returned")
+		}
+
+		// Check if the model wants to use tools
+		if len(resp.Choices[0].Message.ToolCalls) == 0 {
+			// No tool calls, return the response
+			content := strings.TrimSpace(resp.Choices[0].Message.Content)
+			return content, nil
+		}
+
+		// The model wants to use tools
+		toolCalls := resp.Choices[0].Message.ToolCalls
+		c.logger.Info(ctx, "Processing tool calls", map[string]interface{}{
+			"count":     len(toolCalls),
+			"iteration": iteration + 1,
+		})
+
+		// Add the assistant's message with tool calls to the conversation
+		messages = append(messages, resp.Choices[0].Message.ToParam())
+
+		// Process each tool call (same as GenerateWithTools)
+		for _, toolCall := range toolCalls {
+			// Replace multi_tool_use.parallel name if present
+			if toolCall.Function.Name == "multi_tool_use.parallel" {
+				c.logger.Info(ctx, "Replacing multi_tool_use.parallel with parallel_tool_use", nil)
+				toolCall.Function.Name = "parallel_tool_use"
+			}
+
+			if toolCall.Function.Name == "parallel_tool_use" {
+				c.logger.Info(ctx, "Parallel tool call", map[string]interface{}{"toolName": toolCall.Function.Name})
+
+				arguments := toolCall.Function.Arguments
+				var toolUsesWrapper struct {
+					ToolUses []map[string]interface{} `json:"tool_uses"`
+				}
+				err := json.Unmarshal([]byte(arguments), &toolUsesWrapper)
+				if err != nil {
+					c.logger.Error(ctx, "Error unmarshalling tool uses", map[string]interface{}{"error": err.Error()})
+					continue
+				}
+
+				type toolResult struct {
+					index  int
+					result string
+					err    error
+				}
+
+				resultCh := make(chan toolResult, len(toolUsesWrapper.ToolUses))
+				var wg sync.WaitGroup
+
+				// Launch goroutines for concurrent tool execution
+				for i, toolUse := range toolUsesWrapper.ToolUses {
+					wg.Add(1)
+					go func(index int, toolUse map[string]interface{}) {
+						defer wg.Done()
+
+						toolName := toolUse["recipient_name"].(string)
+						parameters := toolUse["parameters"].(map[string]interface{})
+
+						c.logger.Info(ctx, "Parallel tool use", map[string]interface{}{"toolName": toolName, "parameters": parameters})
+
+						// Convert parameters to JSON string
+						paramsBytes, err := json.Marshal(parameters)
+						if err != nil {
+							c.logger.Error(ctx, "Error marshalling parameters", map[string]interface{}{"error": err.Error()})
+							resultCh <- toolResult{index: index, result: "", err: err}
+							return
+						}
+
+						// Find the correct tool for this operation
+						var tool interfaces.Tool
+						for _, t := range tools {
+							if t.Name() == toolName {
+								tool = t
+								break
+							}
+						}
+
+						if tool == nil {
+							err := fmt.Errorf("tool not found: %s", toolName)
+							c.logger.Error(ctx, "Tool not found in parallel execution", map[string]interface{}{"toolName": toolName})
+							resultCh <- toolResult{index: index, result: "", err: err}
+							return
+						}
+
+						c.logger.Info(ctx, "Executing tool", map[string]interface{}{"toolName": toolName, "parameters": string(paramsBytes)})
+
+						result, err := tool.Execute(ctx, string(paramsBytes))
+
+						// Check for repetitive calls and add warning if needed
+						cacheKey := toolName + ":" + string(paramsBytes)
+
+						toolCallHistoryMu.Lock()
+						toolCallHistory[cacheKey]++
+						callCount := toolCallHistory[cacheKey]
+						toolCallHistoryMu.Unlock()
+
+						if callCount > 2 {
+							warning := fmt.Sprintf("\n\n[WARNING: This is call #%d to %s with identical parameters. You may be in a loop. Consider using the available information to provide a final answer.]",
+								callCount,
+								toolName)
+							if err == nil {
+								result += warning
+							}
+							c.logger.Warn(ctx, "Repetitive tool call detected in parallel execution", map[string]interface{}{
+								"toolName":  toolName,
+								"callCount": callCount,
+							})
+						}
+
+						// Store tool call and result in memory if provided
+						if params.Memory != nil {
+							if err != nil {
+								// Store failed parallel tool call result
+								_ = params.Memory.AddMessage(ctx, interfaces.Message{
+									Role:    "assistant",
+									Content: "",
+									ToolCalls: []interfaces.ToolCall{{
+										ID:        toolCall.ID,
+										Name:      toolName,
+										Arguments: string(paramsBytes),
+									}},
+								})
+								_ = params.Memory.AddMessage(ctx, interfaces.Message{
+									Role:       "tool",
+									Content:    fmt.Sprintf("Error: %v", err),
+									ToolCallID: toolCall.ID,
+									Metadata: map[string]interface{}{
+										"tool_name": toolCall.Function.Name,
+									},
+								})
+							} else {
+								// Store successful parallel tool call and result
+								_ = params.Memory.AddMessage(ctx, interfaces.Message{
+									Role:    "assistant",
+									Content: "",
+									ToolCalls: []interfaces.ToolCall{{
+										ID:        toolCall.ID,
+										Name:      toolName,
+										Arguments: string(paramsBytes),
+									}},
+								})
+								_ = params.Memory.AddMessage(ctx, interfaces.Message{
+									Role:       "tool",
+									Content:    result,
+									ToolCallID: toolCall.ID,
+									Metadata: map[string]interface{}{
+										"tool_name": toolCall.Function.Name,
+									},
+								})
+							}
+						}
+
+						resultCh <- toolResult{index: index, result: result, err: err}
+					}(i, toolUse)
+				}
+
+				// Close channel when all goroutines complete
+				go func() {
+					wg.Wait()
+					close(resultCh)
+				}()
+
+				// Collect results and check for errors
+				toolsResults := make([]string, len(toolUsesWrapper.ToolUses))
+				for result := range resultCh {
+					if result.err != nil {
+						c.logger.Error(ctx, "Error executing tool", map[string]interface{}{"error": result.err.Error()})
+						return "", fmt.Errorf("error executing tool: %s", result.err.Error())
+					}
+					toolsResults[result.index] = result.result
+				}
+
+				// For parallel tool use, we need to create a tool message
+				// The new API uses openai.ToolMessage(content, toolCallID) instead of struct literals
+				// Create a structured response that clearly identifies which tool each result came from
+				var structuredResults []string
+				for i, toolUse := range toolUsesWrapper.ToolUses {
+					toolName := toolUse["recipient_name"].(string)
+					result := toolsResults[i]
+					structuredResults = append(structuredResults, fmt.Sprintf("Tool: %s\nResult: %s", toolName, result))
+				}
+				messages = append(messages, openai.ToolMessage(strings.Join(structuredResults, "\n\n"), toolCall.ID))
+				continue
+			}
+
+			// Find the requested tool
+			var selectedTool interfaces.Tool
+			for _, tool := range tools {
+				if tool.Name() == toolCall.Function.Name {
+					selectedTool = tool
+					break
+				}
+			}
+
+			if selectedTool == nil || selectedTool.Name() == "" {
+				c.logger.Error(ctx, "Tool not found", map[string]interface{}{
+					"toolName": toolCall.Function.Name,
+					"toolcall": toolCall,
+					"resp":     resp,
+				})
+
+				// Add tool not found error as tool result instead of returning
+				errorMessage := fmt.Sprintf("Error: tool not found: %s", toolCall.Function.Name)
+
+				// Store failed tool call in memory if provided
+				if params.Memory != nil {
+					_ = params.Memory.AddMessage(ctx, interfaces.Message{
+						Role:    "assistant",
+						Content: "",
+						ToolCalls: []interfaces.ToolCall{{
+							ID:        toolCall.ID,
+							Name:      toolCall.Function.Name,
+							Arguments: toolCall.Function.Arguments,
+						}},
+					})
+					_ = params.Memory.AddMessage(ctx, interfaces.Message{
+						Role:       "tool",
+						Content:    errorMessage,
+						ToolCallID: toolCall.ID,
+						Metadata: map[string]interface{}{
+							"tool_name": toolCall.Function.Name,
+						},
+					})
+				}
+
+				// Add to tracing context
+				toolCallTrace := tracing.ToolCall{
+					Name:       toolCall.Function.Name,
+					Arguments:  toolCall.Function.Arguments,
+					ID:         toolCall.ID,
+					Timestamp:  time.Now().Format(time.RFC3339),
+					StartTime:  time.Now(),
+					Duration:   0,
+					DurationMs: 0,
+					Error:      fmt.Sprintf("tool not found: %s", toolCall.Function.Name),
+					Result:     errorMessage,
+				}
+
+				tracing.AddToolCallToContext(ctx, toolCallTrace)
+
+				// Add error message as tool response
+				messages = append(messages, openai.ToolMessage(errorMessage, toolCall.ID))
+
+				continue // Continue processing other tool calls
+			}
+
+			// Execute the tool
+			c.logger.Info(ctx, "Executing tool", map[string]interface{}{"toolName": selectedTool.Name()})
+			toolStartTime := time.Now()
+			toolResult, err := selectedTool.Execute(ctx, toolCall.Function.Arguments)
+			toolEndTime := time.Now()
+
+			// Check for repetitive calls and add warning if needed
+			cacheKey := toolCall.Function.Name + ":" + toolCall.Function.Arguments
+
+			toolCallHistoryMu.Lock()
+			toolCallHistory[cacheKey]++
+			callCount := toolCallHistory[cacheKey]
+			toolCallHistoryMu.Unlock()
+
+			if callCount > 1 {
+				warning := fmt.Sprintf("\n\n[WARNING: This is call #%d to %s with identical parameters. You may be in a loop. Consider using the available information to provide a final answer.]",
+					callCount,
+					toolCall.Function.Name)
+				if err == nil {
+					toolResult += warning
+				}
+				c.logger.Warn(ctx, "Repetitive tool call detected", map[string]interface{}{
+					"toolName":  toolCall.Function.Name,
+					"callCount": callCount,
+				})
+			}
+
+			// Add tool call to tracing context
+			executionDuration := toolEndTime.Sub(toolStartTime)
+			toolCallTrace := tracing.ToolCall{
+				Name:       toolCall.Function.Name,
+				Arguments:  toolCall.Function.Arguments,
+				ID:         toolCall.ID,
+				Timestamp:  toolStartTime.Format(time.RFC3339),
+				StartTime:  toolStartTime,
+				Duration:   executionDuration,
+				DurationMs: executionDuration.Milliseconds(),
+			}
+
+			// Store tool call and result in memory if provided
+			if params.Memory != nil {
+				if err != nil {
+					// Store failed tool call result
+					_ = params.Memory.AddMessage(ctx, interfaces.Message{
+						Role:    "assistant",
+						Content: "",
+						ToolCalls: []interfaces.ToolCall{{
+							ID:        toolCall.ID,
+							Name:      toolCall.Function.Name,
+							Arguments: toolCall.Function.Arguments,
+						}},
+					})
+					_ = params.Memory.AddMessage(ctx, interfaces.Message{
+						Role:       "tool",
+						Content:    fmt.Sprintf("Error: %v", err),
+						ToolCallID: toolCall.ID,
+						Metadata: map[string]interface{}{
+							"tool_name": toolCall.Function.Name,
+						},
+					})
+				} else {
+					// Store successful tool call and result
+					_ = params.Memory.AddMessage(ctx, interfaces.Message{
+						Role:    "assistant",
+						Content: "",
+						ToolCalls: []interfaces.ToolCall{{
+							ID:        toolCall.ID,
+							Name:      toolCall.Function.Name,
+							Arguments: toolCall.Function.Arguments,
+						}},
+					})
+					_ = params.Memory.AddMessage(ctx, interfaces.Message{
+						Role:       "tool",
+						Content:    toolResult,
+						ToolCallID: toolCall.ID,
+						Metadata: map[string]interface{}{
+							"tool_name": toolCall.Function.Name,
+						},
+					})
+				}
+			}
+
+			if err != nil {
+				c.logger.Error(ctx, "Error executing tool", map[string]interface{}{"toolName": selectedTool.Name(), "error": err.Error()})
+				toolCallTrace.Error = err.Error()
+				toolCallTrace.Result = fmt.Sprintf("Error: %v", err)
+				// Add error message as tool response
+				messages = append(messages, openai.ToolMessage(fmt.Sprintf("Error: %v", err), toolCall.ID))
+			} else {
+				toolCallTrace.Result = toolResult
+				// Add tool result to messages
+				messages = append(messages, openai.ToolMessage(toolResult, toolCall.ID))
+			}
+
+			// Add the tool call to the tracing context
+			tracing.AddToolCallToContext(ctx, toolCallTrace)
+		}
+
+		// Continue to the next iteration with updated messages
+	}
+
+	// If we've reached the maximum iterations and the model is still requesting tools,
+	// make one final call without tools to get a conclusion
+	c.logger.Info(ctx, "Maximum iterations reached, making final call without tools", map[string]interface{}{
+		"maxIterations": maxIterations,
+	})
+
+	// Create a final request without tools to force the LLM to provide a conclusion
+	finalReq := openai.ChatCompletionNewParams{
+		Model:            openai.ChatModel(c.Model),
+		Messages:         messages,
+		Tools:            nil, // No tools for final call
+		Temperature:      openai.Float(c.getTemperatureForModel(params.LLMConfig.Temperature)),
+		FrequencyPenalty: openai.Float(params.LLMConfig.FrequencyPenalty),
+		PresencePenalty:  openai.Float(params.LLMConfig.PresencePenalty),
+	}
+
+	// Reasoning models don't support top_p parameter
+	if !isReasoningModel(c.Model) {
+		finalReq.TopP = openai.Float(params.LLMConfig.TopP)
+	}
+
+	if len(params.LLMConfig.StopSequences) > 0 {
+		finalReq.Stop = openai.ChatCompletionNewParamsStopUnion{OfStringArray: params.LLMConfig.StopSequences}
+	}
+
+	// Set response format if provided
+	if params.ResponseFormat != nil {
+		jsonSchema := shared.ResponseFormatJSONSchemaJSONSchemaParam{
+			Name:   params.ResponseFormat.Name,
+			Schema: params.ResponseFormat.Schema,
+		}
+
+		finalReq.ResponseFormat = openai.ChatCompletionNewParamsResponseFormatUnion{
+			OfJSONSchema: &shared.ResponseFormatJSONSchemaParam{
+				Type:       "json_schema",
+				JSONSchema: jsonSchema,
+			},
+		}
+	}
+
+	// Add a system message to encourage conclusion
+	conclusionMessage := openai.SystemMessage("Please provide your final response based on the information available. Do not request any additional tools.")
+	finalReq.Messages = append(finalReq.Messages, conclusionMessage)
+
+	c.logger.Debug(ctx, "Making final request without tools", map[string]interface{}{
+		"messages": len(finalReq.Messages),
+	})
+
+	finalResp, err := c.ChatService.Completions.New(ctx, finalReq)
+	if err != nil {
+		c.logger.Error(ctx, "Error in final call without tools", map[string]interface{}{"error": err.Error()})
+		return "", fmt.Errorf("failed to create final chat completion: %w", err)
+	}
+
+	if len(finalResp.Choices) == 0 {
+		return "", fmt.Errorf("no completions returned in final call")
+	}
+
+	content := strings.TrimSpace(finalResp.Choices[0].Message.Content)
+	c.logger.Info(ctx, "Successfully received final response without tools", nil)
+	return content, nil
+}

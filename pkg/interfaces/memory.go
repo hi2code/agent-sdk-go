@@ -18,6 +18,26 @@ const (
 	MessageRoleTool MessageRole = "tool"
 )
 
+type ContentPartType string
+
+const (
+	ContentPartTypeImage ContentPartType = "image"
+	ContentPartTypeText  ContentPartType = "text"
+)
+
+// ImageContent
+type ImageContent struct {
+	URLOrBase64 string
+	Detail      string `json:"detail,omitempty"` // "auto", "low", "high"
+}
+
+// MultiContentPart represents a part of a message content
+type MultiContentPart struct {
+	Type  ContentPartType
+	Text  string
+	Image *ImageContent
+}
+
 // Message represents a message in a conversation
 type Message struct {
 	// Role is the role of the message sender
@@ -25,6 +45,9 @@ type Message struct {
 
 	// Content is the content of the message
 	Content string
+
+	// MultiContent holds multiple content parts for multimodal messages
+	MultiContent []MultiContentPart
 
 	// Metadata contains additional information about the message
 	Metadata map[string]interface{}
