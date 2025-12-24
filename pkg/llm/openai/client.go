@@ -1308,11 +1308,14 @@ func (c *OpenAIClient) GenerateWithToolsMultiContent(ctx context.Context, prompt
 			return content, nil
 		}
 
+		assistantMsgRaw := resp.Choices[0].Message
+		assistantContent := assistantMsgRaw.Content
 		// The model wants to use tools
 		toolCalls := resp.Choices[0].Message.ToolCalls
 		c.logger.Info(ctx, "Processing tool calls", map[string]interface{}{
-			"count":     len(toolCalls),
-			"iteration": iteration + 1,
+			"count":       len(toolCalls),
+			"iteration":   iteration + 1,
+			"has_content": len(assistantContent) > 0,
 		})
 
 		// Add the assistant's message with tool calls to the conversation
@@ -1507,7 +1510,7 @@ func (c *OpenAIClient) GenerateWithToolsMultiContent(ctx context.Context, prompt
 				if params.Memory != nil {
 					_ = params.Memory.AddMessage(ctx, interfaces.Message{
 						Role:    "assistant",
-						Content: "",
+						Content: assistantContent,
 						ToolCalls: []interfaces.ToolCall{{
 							ID:        toolCall.ID,
 							Name:      toolCall.Function.Name,
@@ -1590,7 +1593,7 @@ func (c *OpenAIClient) GenerateWithToolsMultiContent(ctx context.Context, prompt
 					// Store failed tool call result
 					_ = params.Memory.AddMessage(ctx, interfaces.Message{
 						Role:    "assistant",
-						Content: "",
+						Content: assistantContent,
 						ToolCalls: []interfaces.ToolCall{{
 							ID:        toolCall.ID,
 							Name:      toolCall.Function.Name,
@@ -1609,7 +1612,7 @@ func (c *OpenAIClient) GenerateWithToolsMultiContent(ctx context.Context, prompt
 					// Store successful tool call and result
 					_ = params.Memory.AddMessage(ctx, interfaces.Message{
 						Role:    "assistant",
-						Content: "",
+						Content: assistantContent,
 						ToolCalls: []interfaces.ToolCall{{
 							ID:        toolCall.ID,
 							Name:      toolCall.Function.Name,
